@@ -1,5 +1,5 @@
 {
-  "name": "mqtt-mqtt-duplicator",
+  "name": "waltti-apc-mqtt-mqtt-duplicator",
   "version": "0.1.0",
   "description": "Duplicate MQTT topics from a source broker to a destination broker (RabbitMQ MQTT)",
   "main": "dist/index.js",
@@ -15,7 +15,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tvv-lippu-ja-maksujarjestelma-oy/mqtt-mqtt-duplicator.git"
+    "url": "git+https://github.com/tvv-lippu-ja-maksujarjestelma-oy/waltti-apc-mqtt-mqtt-duplicator.git"
   },
   "keywords": [
     "mqtt",
@@ -26,9 +26,9 @@
   "author": "haphut <haphut@mistmap.com>",
   "license": "EUPL-1.2",
   "bugs": {
-    "url": "https://github.com/tvv-lippu-ja-maksujarjestelma-oy/mqtt-mqtt-duplicator/issues"
+    "url": "https://github.com/tvv-lippu-ja-maksujarjestelma-oy/waltti-apc-mqtt-mqtt-duplicator/issues"
   },
-  "homepage": "https://github.com/tvv-lippu-ja-maksujarjestelma-oy/mqtt-mqtt-duplicator#readme",
+  "homepage": "https://github.com/tvv-lippu-ja-maksujarjestelma-oy/waltti-apc-mqtt-mqtt-duplicator#readme",
   "devDependencies": {
     "@tsconfig/strictest": "^2.0.2",
     "@types/jest": "^29.5.10",
