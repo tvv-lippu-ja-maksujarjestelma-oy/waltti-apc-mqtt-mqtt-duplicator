@@ -39,29 +39,38 @@ This repository has been created as part of the [Waltti APC](https://github.com/
 
 Build your own Docker image or publish under your registry.
 
+## Loop Prevention
+
+This duplicator uses **MQTT 5.0 user properties** to prevent infinite message loops when running multiple duplicators in opposite directions (e.g., dev→staging and staging→dev).
+
+When a message is forwarded, the duplicator adds a user property `x-forwarded-by` with its `DUPLICATOR_ID`. When receiving a message, the duplicator checks for this property and skips any message that has already been forwarded by another duplicator.
+
+This requires both source and destination brokers to support MQTT 5.0. RabbitMQ supports MQTT 5.0 since version 3.11.
+
 ## Configuration
 
-| Environment variable                  | Required? | Default             | Description                                              |
-| ------------------------------------- | --------- | ------------------- | -------------------------------------------------------- |
-| `HEALTH_CHECK_PORT`                   | No        | `8080`              | Health endpoint port.                                    |
-| `SOURCE_MQTT_URL`                     | Yes       |                     | Source broker URL.                                       |
-| `SOURCE_MQTT_USERNAME_PATH`           | No        |                     | File path for source username (with password path).      |
-| `SOURCE_MQTT_PASSWORD_PATH`           | No        |                     | File path for source password (with username path).      |
-| `SOURCE_MQTT_CLIENT_ID_PREFIX`        | Yes       |                     | Client ID prefix for source.                             |
-| `SOURCE_MQTT_CLIENT_ID_SUFFIX_LENGTH` | No        | `0`                 | Random suffix length for source Client ID.               |
-| `SOURCE_MQTT_TOPIC_FILTER`            | Yes       |                     | Topic filter to subscribe (e.g. `apc-from-vehicle/#`).   |
-| `SOURCE_MQTT_QOS`                     | No        | `2`                 | Subscription QoS.                                        |
-| `SOURCE_MQTT_CLEAN_SESSION`           | No        | `false`             | Use clean session at source.                             |
-| `DEST_MQTT_URL`                       | Yes       |                     | Destination (RabbitMQ MQTT) URL.                         |
-| `DEST_MQTT_USERNAME_PATH`             | No        |                     | File path for destination username (with password path). |
-| `DEST_MQTT_PASSWORD_PATH`             | No        |                     | File path for destination password (with username path). |
-| `DEST_MQTT_CLIENT_ID_PREFIX`          | Yes       |                     | Client ID prefix for destination.                        |
-| `DEST_MQTT_CLIENT_ID_SUFFIX_LENGTH`   | No        | `0`                 | Random suffix length for destination Client ID.          |
-| `DEST_MQTT_CLEAN_SESSION`             | No        | `true`              | Use clean session at destination.                        |
-| `FORWARD_QOS_MAX`                     | No        | `1`                 | Upper bound for publish QoS (uses min with incoming).    |
-| `FORWARD_RETAIN`                      | No        | `true`              | Whether to forward retained flag.                        |
-| `SAVE_MESSAGES_TO_FILE`               | No        | `false`             | If `true`, saves each message to an NDJSON file.         |
-| `SAVE_MESSAGES_FILE_PATH`             | No        | `./messages.ndjson` | Output path for the NDJSON log.                          |
+| Environment variable                  | Required? | Default             | Description                                                  |
+| ------------------------------------- | --------- | ------------------- | ------------------------------------------------------------ |
+| `DUPLICATOR_ID`                       | Yes       |                     | Unique identifier for this duplicator (for loop prevention). |
+| `HEALTH_CHECK_PORT`                   | No        | `8080`              | Health endpoint port.                                        |
+| `SOURCE_MQTT_URL`                     | Yes       |                     | Source broker URL.                                           |
+| `SOURCE_MQTT_USERNAME_PATH`           | No        |                     | File path for source username (with password path).          |
+| `SOURCE_MQTT_PASSWORD_PATH`           | No        |                     | File path for source password (with username path).          |
+| `SOURCE_MQTT_CLIENT_ID_PREFIX`        | Yes       |                     | Client ID prefix for source.                                 |
+| `SOURCE_MQTT_CLIENT_ID_SUFFIX_LENGTH` | No        | `0`                 | Random suffix length for source Client ID.                   |
+| `SOURCE_MQTT_TOPIC_FILTER`            | Yes       |                     | Topic filter to subscribe (e.g. `apc-from-vehicle/#`).       |
+| `SOURCE_MQTT_QOS`                     | No        | `2`                 | Subscription QoS.                                            |
+| `SOURCE_MQTT_CLEAN_SESSION`           | No        | `false`             | Use clean session at source.                                 |
+| `DEST_MQTT_URL`                       | Yes       |                     | Destination (RabbitMQ MQTT) URL.                             |
+| `DEST_MQTT_USERNAME_PATH`             | No        |                     | File path for destination username (with password path).     |
+| `DEST_MQTT_PASSWORD_PATH`             | No        |                     | File path for destination password (with username path).     |
+| `DEST_MQTT_CLIENT_ID_PREFIX`          | Yes       |                     | Client ID prefix for destination.                            |
+| `DEST_MQTT_CLIENT_ID_SUFFIX_LENGTH`   | No        | `0`                 | Random suffix length for destination Client ID.              |
+| `DEST_MQTT_CLEAN_SESSION`             | No        | `true`              | Use clean session at destination.                            |
+| `FORWARD_QOS_MAX`                     | No        | `1`                 | Upper bound for publish QoS (uses min with incoming).        |
+| `FORWARD_RETAIN`                      | No        | `true`              | Whether to forward retained flag.                            |
+| `SAVE_MESSAGES_TO_FILE`               | No        | `false`             | If `true`, saves each message to an NDJSON file.             |
+| `SAVE_MESSAGES_FILE_PATH`             | No        | `./messages.ndjson` | Output path for the NDJSON log.                              |
 
 ### Saving messages to file (NDJSON)
 

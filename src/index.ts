@@ -142,6 +142,7 @@ const exitGracefully = async (
         logger,
         config.source,
         config.dest,
+        config.duplicatorId,
         config.saveToFile,
       ));
       logger.info("Set health check status to OK");
