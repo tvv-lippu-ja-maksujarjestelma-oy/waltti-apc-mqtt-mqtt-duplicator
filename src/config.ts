@@ -25,12 +25,13 @@ export interface Config {
   dest: DestMqttConfig;
   healthCheck: HealthCheckConfig;
   saveToFile: SaveToFileConfig;
+  duplicatorId: string;
 }
 
 const getRequired = (envVariable: string) => {
   const variable = process.env[envVariable];
-  if (variable === undefined) {
-    throw new Error(`${envVariable} must be defined`);
+  if (variable === undefined || variable === "") {
+    throw new Error(`${envVariable} must be defined and non-empty`);
   }
   return variable;
 };
@@ -144,6 +145,7 @@ const getSourceMqttConfig = (): SourceMqttConfig => {
     clientOptions: {
       clientId,
       clean,
+      protocolVersion: 5,
       ...auth,
     },
     subscribeOptions: {
@@ -170,6 +172,7 @@ const getDestMqttConfig = (): DestMqttConfig => {
     clientOptions: {
       clientId,
       clean,
+      protocolVersion: 5,
       ...auth,
     },
     qosMax,
@@ -187,4 +190,5 @@ export const getConfig = (): Config => ({
   dest: getDestMqttConfig(),
   healthCheck: getHealthCheckConfig(),
   saveToFile: getSaveToFileConfig(),
+  duplicatorId: getRequired("DUPLICATOR_ID"),
 });

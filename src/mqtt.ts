@@ -9,6 +9,20 @@ import type {
 } from "./config";
 import transformUnknownToError from "./util";
 
+/**
+ * User property key used to mark messages that have been forwarded by a duplicator.
+ * This prevents infinite loops when multiple duplicators run in opposite directions.
+ */
+const FORWARDED_BY_PROPERTY = "x-forwarded-by";
+
+interface UserProperties {
+  [key: string]: string | undefined;
+}
+
+interface MqttProperties {
+  userProperties?: UserProperties;
+}
+
 export interface DuplicatorClients {
   sourceClient: mqtt.AsyncMqttClient;
   destClient: mqtt.AsyncMqttClient;
@@ -31,6 +45,7 @@ const createDuplicator = async (
   logger: pino.Logger,
   source: SourceMqttConfig,
   dest: DestMqttConfig,
+  duplicatorId: string,
   saveToFile?: SaveToFileConfig,
 ): Promise<DuplicatorClients> => {
   const sourceClient = await connectMqtt(
@@ -74,6 +89,7 @@ const createDuplicator = async (
   const logIntervalInSeconds = 60;
   let nRecentForwarded = 0;
   let nRecentDropped = 0;
+  let nRecentSkippedLoop = 0;
 
   // Optional NDJSON file writer
   let writer: fs.WriteStream | undefined;
@@ -101,14 +117,31 @@ const createDuplicator = async (
 
   setInterval(() => {
     logger.info(
-      { nRecentForwarded, nRecentDropped },
+      { nRecentForwarded, nRecentDropped, nRecentSkippedLoop },
       "messages forwarded to destination MQTT",
     );
     nRecentForwarded = 0;
     nRecentDropped = 0;
+    nRecentSkippedLoop = 0;
   }, 1_000 * logIntervalInSeconds);
 
   sourceClient.on("message", (topic, message, packet) => {
+    // Access MQTT 5.0 properties for loop prevention
+    const packetProperties = (packet as { properties?: MqttProperties })
+      .properties;
+
+    // Check if this message was already forwarded by another duplicator (loop prevention)
+    const forwardedBy =
+      packetProperties?.userProperties?.[FORWARDED_BY_PROPERTY];
+    if (forwardedBy) {
+      nRecentSkippedLoop += 1;
+      logger.debug(
+        { topic, forwardedBy },
+        "Skipping message already forwarded by another duplicator",
+      );
+      return;
+    }
+
     const qos = Math.min(packet.qos, dest.qosMax) as mqtt.QoS;
     const retain = dest.forwardRetain ? packet.retain : false;
     logger.debug(
@@ -152,23 +185,35 @@ const createDuplicator = async (
         logger.error({ err }, "Failed to write message to file");
       }
     }
-    destClient.publish(topic, message, { qos, retain }).then(
-      () => {
-        nRecentForwarded += 1;
-        logger.debug(
-          { topic, qos, retain, payloadBytes: message.length },
-          "Published message to destination MQTT",
-        );
-      },
-      (error) => {
-        const err = transformUnknownToError(error);
-        logger.error(
-          { err, topic, qos, retain },
-          "Publishing to destination failed",
-        );
-        nRecentDropped += 1;
-      },
-    );
+
+    // Publish with x-forwarded-by user property to prevent loops
+    destClient
+      .publish(topic, message, {
+        qos,
+        retain,
+        properties: {
+          userProperties: {
+            [FORWARDED_BY_PROPERTY]: duplicatorId,
+          },
+        },
+      })
+      .then(
+        () => {
+          nRecentForwarded += 1;
+          logger.debug(
+            { topic, qos, retain, payloadBytes: message.length },
+            "Published message to destination MQTT",
+          );
+        },
+        (error) => {
+          const err = transformUnknownToError(error);
+          logger.error(
+            { err, topic, qos, retain },
+            "Publishing to destination failed",
+          );
+          nRecentDropped += 1;
+        },
+      );
   });
 
   logger.info("Subscribe to source MQTT topics");
