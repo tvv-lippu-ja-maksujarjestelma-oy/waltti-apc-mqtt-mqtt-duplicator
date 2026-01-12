@@ -2,7 +2,7 @@
   "name": "waltti-apc-mqtt-mqtt-duplicator",
   "version": "0.1.0",
   "description": "Duplicate MQTT topics from a source broker to a destination broker (RabbitMQ MQTT)",
-  "main": "dist/index.js",
+  "main": "dist/src/index.js",
   "scripts": {
     "build": "rm -rf dist && tsc",
     "check-and-build": "npm run ts:check && npm run prettier:check && npm run eslint && npm run test && npm run build",
