@@ -69,4 +69,4 @@ COPY \
   ./node_modules
 
 ENTRYPOINT ["/usr/bin/tini", "--", "docker-entrypoint.sh"]
-CMD ["node", "./dist/index.js"]
+CMD ["node", "./dist/src/index.js"]
