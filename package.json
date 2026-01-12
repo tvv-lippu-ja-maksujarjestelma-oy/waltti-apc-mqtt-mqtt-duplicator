@@ -1,0 +1,59 @@
+{
+  "name": "mqtt-mqtt-duplicator",
+  "version": "0.1.0",
+  "description": "Duplicate MQTT topics from a source broker to a destination broker (RabbitMQ MQTT)",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "rm -rf dist && tsc",
+    "check-and-build": "npm run ts:check && npm run prettier:check && npm run eslint && npm run test && npm run build",
+    "eslint": "eslint . --ext .ts --max-warnings=0",
+    "prettier": "prettier --write .",
+    "prettier:check": "prettier --check .",
+    "start": "node dist/src/index.js",
+    "test": "jest",
+    "ts:check": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tvv-lippu-ja-maksujarjestelma-oy/mqtt-mqtt-duplicator.git"
+  },
+  "keywords": [
+    "mqtt",
+    "rabbitmq",
+    "duplicator",
+    "bridge"
+  ],
+  "author": "haphut <haphut@mistmap.com>",
+  "license": "EUPL-1.2",
+  "bugs": {
+    "url": "https://github.com/tvv-lippu-ja-maksujarjestelma-oy/mqtt-mqtt-duplicator/issues"
+  },
+  "homepage": "https://github.com/tvv-lippu-ja-maksujarjestelma-oy/mqtt-mqtt-duplicator#readme",
+  "devDependencies": {
+    "@tsconfig/strictest": "^2.0.2",
+    "@types/jest": "^29.5.10",
+    "@types/node": "^20.10.3",
+    "@typescript-eslint/eslint-plugin": "^6.13.2",
+    "@typescript-eslint/parser": "^6.13.2",
+    "eslint": "^8.55.0",
+    "eslint-config-airbnb-base": "^15.0.0",
+    "eslint-config-airbnb-typescript": "^17.1.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-eslint-comments": "^3.2.0",
+    "eslint-plugin-import": "^2.29.0",
+    "eslint-plugin-jest": "^27.6.0",
+    "eslint-plugin-prettier": "^5.0.1",
+    "jest": "^29.7.0",
+    "prettier": "^3.1.0",
+    "typescript": "^5.3.2"
+  },
+  "dependencies": {
+    "async-mqtt": "^2.6.3",
+    "pino": "^8.16.2"
+  },
+  "jest": {
+    "testPathIgnorePatterns": [
+      "./dist"
+    ]
+  }
+}
