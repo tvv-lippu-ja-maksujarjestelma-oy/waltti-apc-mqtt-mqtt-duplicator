@@ -23,7 +23,7 @@
     "duplicator",
     "bridge"
   ],
-  "author": "haphut <haphut@mistmap.com>",
+  "author": "pnupu <ilkka@vertics.co>",
   "license": "EUPL-1.2",
   "bugs": {
     "url": "https://github.com/tvv-lippu-ja-maksujarjestelma-oy/waltti-apc-mqtt-mqtt-duplicator/issues"
