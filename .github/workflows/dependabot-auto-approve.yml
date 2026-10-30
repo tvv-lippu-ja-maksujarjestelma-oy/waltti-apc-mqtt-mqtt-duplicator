@@ -14,23 +14,40 @@ jobs:
     steps:
       - name: Dependabot metadata
         id: dependabot-metadata
-        uses: dependabot/fetch-metadata@v1
+        uses: dependabot/fetch-metadata@v3
         with:
           github-token: "${{ secrets.GITHUB_TOKEN }}"
       - name: Approve patch and minor updates
+        id: approve-patch-minor
         if: ${{steps.dependabot-metadata.outputs.update-type == 'version-update:semver-patch' || steps.dependabot-metadata.outputs.update-type == 'version-update:semver-minor'}}
         run: gh pr review "${PR_URL}" --approve --body "I **approve** this pull request because it includes a **patch or minor update**."
         env:
           PR_URL: ${{github.event.pull_request.html_url}}
           GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+      - name: Approve GitHub Actions updates
+        id: approve-actions
+        # CI runs on the updated actions, so a green PR has exercised them.
+        if: ${{steps.dependabot-metadata.outputs.package-ecosystem == 'github_actions'}}
+        run: gh pr review "${PR_URL}" --approve --body "I **approve** this pull request because it only updates **GitHub Actions** used in CI."
+        env:
+          PR_URL: ${{github.event.pull_request.html_url}}
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
       - name: Approve major updates of development dependencies
+        id: approve-dev-major
         if: ${{steps.dependabot-metadata.outputs.update-type == 'version-update:semver-major' && steps.dependabot-metadata.outputs.dependency-type == 'direct:development'}}
         run: gh pr review "${PR_URL}" --approve -b "I **approve** this pull request because it includes a **major update of a dependency used only in development**."
         env:
           PR_URL: ${{github.event.pull_request.html_url}}
           GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+      - name: Enable auto-merge for approved updates
+        if: ${{steps.approve-patch-minor.outcome == 'success' || steps.approve-actions.outcome == 'success' || steps.approve-dev-major.outcome == 'success'}}
+        # Mergify is not installed on this repository, so use native auto-merge after approval.
+        run: gh pr merge --auto --rebase "${PR_URL}"
+        env:
+          PR_URL: ${{github.event.pull_request.html_url}}
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
       - name: Comment on major updates of non-development dependencies
-        if: ${{steps.dependabot-metadata.outputs.update-type == 'version-update:semver-major' && steps.dependabot-metadata.outputs.dependency-type == 'direct:production'}}
+        if: ${{steps.dependabot-metadata.outputs.update-type == 'version-update:semver-major' && steps.dependabot-metadata.outputs.dependency-type == 'direct:production' && steps.dependabot-metadata.outputs.package-ecosystem != 'github_actions'}}
         run: |
           gh pr comment "${PR_URL}" --body "I **do not approve** this PR because it includes a **major update of a dependency used in production**."
           gh pr edit "${PR_URL}" --add-label "help wanted"
