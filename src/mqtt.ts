@@ -37,7 +37,6 @@ const connectMqtt = async (
 ) => {
   logger.info({ name, url }, "Connect to MQTT broker");
   // There is a try-catch at the caller.
-  // eslint-disable-next-line @typescript-eslint/return-await
   return await mqtt.connectAsync(url, options);
 };
 
@@ -65,7 +64,7 @@ const createDuplicator = async (
   const attachClientEventLogs = (
     name: string,
     client: mqtt.AsyncMqttClient,
-    clientId?: string | undefined,
+    clientId?: string,
   ) => {
     client.on("connect", () =>
       logger.debug({ name, clientId }, "MQTT client connected"),
