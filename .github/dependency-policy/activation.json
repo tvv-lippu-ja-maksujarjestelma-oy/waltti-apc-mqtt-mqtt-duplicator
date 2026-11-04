@@ -1,0 +1,14 @@
+{
+  "enabled": false,
+  "hostPrerequisitesVerified": false,
+  "requiredChecks": [
+    {
+      "context": "CodeQL",
+      "app_id": 57789
+    },
+    {
+      "context": "Build, check, test, push",
+      "app_id": 15368
+    }
+  ]
+}
