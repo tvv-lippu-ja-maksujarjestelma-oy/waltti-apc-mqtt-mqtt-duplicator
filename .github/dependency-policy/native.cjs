@@ -6,6 +6,40 @@ const REQUIRED = activation.requiredChecks;
 const PUBLISHER = "github-actions[bot]";
 const BLOCKED =
   "Policy, current pnupu approval, hold, conflict or required CI blocks merge";
+const CANARY_BLOCKED = "Canary policy blocks merge";
+const CANARY_MAX_MS = 24 * 60 * 60 * 1000;
+const MERGE_AUTHORIZED =
+  "Dependency policy passed; no native auto-merge request is queued";
+const RETRY_REQUIRED =
+  "Protected merge did not complete: retry via workflow_dispatch";
+const STATUS_CAP = 1000; // GitHub limit per SHA and context, across publishers.
+
+function validCanary(canary) {
+  if (
+    !canary ||
+    typeof canary !== "object" ||
+    Array.isArray(canary) ||
+    Object.keys(canary).some(
+      (key) => !["pr", "issuedAt", "expiresAt", "mergeApproved"].includes(key),
+    )
+  )
+    return false;
+  // Timestamps are UTC Unix milliseconds. Approval, when present, is a full SHA.
+  const { pr, issuedAt, expiresAt, mergeApproved } = canary;
+  return (
+    Number.isSafeInteger(pr) &&
+    pr > 0 &&
+    Number.isSafeInteger(issuedAt) &&
+    issuedAt > 0 &&
+    Number.isSafeInteger(expiresAt) &&
+    expiresAt > issuedAt &&
+    expiresAt - issuedAt <= CANARY_MAX_MS &&
+    (mergeApproved == null ||
+      (typeof mergeApproved === "string" &&
+        mergeApproved.length === 40 &&
+        /^[0-9a-f]{40}$/.test(mergeApproved)))
+  );
+}
 
 function checkStates(required, runs, statuses) {
   return required.map(({ context, app_id }) => {
@@ -36,12 +70,25 @@ async function run({
   policy,
   enabled = activation.enabled,
   hostPrerequisitesVerified = activation.hostPrerequisitesVerified,
+  canary = activation.canary,
   requiredChecks = REQUIRED,
+  now = Date.now,
 }) {
-  policy ||= enabled
-    ? require("./policy.cjs")
-    : { CONTEXT: "Dependency policy" };
+  const isCanary = canary != null;
+  const wellFormedCanary = validCanary(canary);
+  const inCanaryWindow = wellFormedCanary
+    ? () => {
+        const time = now();
+        return canary.issuedAt <= time && time < canary.expiresAt;
+      }
+    : () => false;
+  policy ||=
+    enabled || wellFormedCanary
+      ? require("./policy.cjs")
+      : { CONTEXT: "Dependency policy" };
   const { classify, eligible, CONTEXT } = policy;
+  const isOwnPolicyStatus = (s) =>
+    s.context === CONTEXT && s.creator?.login === PUBLISHER;
   const repo = context.repo;
   const list = (method, args) =>
     github.paginate(method, { ...repo, per_page: 100, ...args });
@@ -53,6 +100,10 @@ async function run({
     const args = { ...repo, pull_number };
     let sha = candidate.head.sha;
     let cached, cachedSHA;
+    let canaryBot = false;
+    let authorizationAttempted = false;
+    const latestOwn = () =>
+      cached.filter(isOwnPolicyStatus).sort((a, b) => b.id - a.id)[0];
     const readStatuses = async () => {
       cached = await list(github.rest.repos.listCommitStatusesForRef, {
         ref: sha,
@@ -60,7 +111,7 @@ async function run({
       cachedSHA = sha;
       return cached;
     };
-    const publish = async (state, description) => {
+    const publish = async (state, description, force = false) => {
       description = description.slice(0, 140);
       if (!cached || cachedSHA !== sha) {
         try {
@@ -73,10 +124,12 @@ async function run({
           cachedSHA = sha;
         }
       }
-      const previous = cached
-        .filter((s) => s.context === CONTEXT && s.creator?.login === PUBLISHER)
-        .sort((a, b) => b.id - a.id)[0];
-      if (previous?.state === state && previous.description === description)
+      const previous = latestOwn();
+      if (
+        !force &&
+        previous?.state === state &&
+        previous.description === description
+      )
         return;
       const { data: written } = await github.rest.repos.createCommitStatus({
         ...repo,
@@ -152,9 +205,14 @@ async function run({
         );
         continue;
       }
+      canaryBot = isCanary;
       await revoke(pr); // Also revoke old queued requests while activation is disabled.
       if (pr.state !== "open" || pr.base.ref !== "main") continue;
-      if (!enabled) {
+      if (isCanary && (!inCanaryWindow() || canary.pr !== pull_number)) {
+        await publish("failure", CANARY_BLOCKED);
+        continue;
+      }
+      if (!isCanary && !enabled) {
         await publish(
           "failure",
           "Activation disabled: final shared source and host prerequisites required",
@@ -162,13 +220,20 @@ async function run({
         continue;
       }
       if (
-        !hostPrerequisitesVerified ||
+        (!isCanary && !hostPrerequisitesVerified) ||
         !requiredChecks.length ||
         requiredChecks.some((r) => !r.context || !Number.isInteger(r.app_id))
       )
         throw new Error(
           "Host prerequisite attestation or required-check configuration missing",
         );
+      // Only a separately approved exact head can enter the canary merge path.
+      // Observation keeps the required status red even if an old success exists.
+      const observing =
+        isCanary && (!canary.mergeApproved || canary.mergeApproved !== sha);
+      // Both bot PRs can share a SHA. Keep their blocking writes identical.
+      const blocked = isCanary ? CANARY_BLOCKED : BLOCKED;
+      if (observing) await publish("failure", blocked);
       const ci = requiredChecks;
       const evaluate = async () => {
         const current = await getPR();
@@ -221,6 +286,19 @@ async function run({
         });
         const runs = await list(github.rest.checks.listForRef, { ref: sha });
         const statuses = await readStatuses();
+        // A required status is SHA-scoped. Do not authorize a second bot PR
+        // accidentally when issuing a canary's merge-authorizing status.
+        const sharedBotHead =
+          isCanary &&
+          !observing &&
+          (
+            await list(github.rest.pulls.list, { state: "open", base: "main" })
+          ).some(
+            (other) =>
+              other.number !== pull_number &&
+              other.user?.login === "dependabot[bot]" &&
+              other.head.sha === sha,
+          );
         const fresh = await getPR();
         if (
           fresh.head.sha !== sha ||
@@ -231,6 +309,8 @@ async function run({
             "Head/base or native auto-merge changed during evaluation",
           );
         return (
+          !sharedBotHead &&
+          (!isCanary || inCanaryWindow()) &&
           fresh.mergeable_state !== "behind" &&
           eligible({
             pr: fresh,
@@ -238,21 +318,64 @@ async function run({
             reviews,
             checks: checkStates(ci, runs, statuses),
             requiredCheckCount: ci.length,
-            activated: enabled,
+            activated: true,
           })
         );
       };
-      if (!(await evaluate())) {
-        await publish("failure", BLOCKED);
+      const passes = await evaluate();
+      if (observing) {
+        core.info(
+          `Canary PR ${pull_number} at ${sha}: ${passes ? "eligible" : "blocked"} (observation only)`,
+        );
         continue;
       }
-      await publish(
-        "success",
-        "Dependency policy passed; no native auto-merge request is queued",
+      if (!passes || (isCanary && !inCanaryWindow())) {
+        await publish("failure", blocked);
+        continue;
+      }
+      const retryLatched = cached.some(
+        (s) =>
+          isOwnPolicyStatus(s) &&
+          ((s.state === "failure" && s.description === RETRY_REQUIRED) ||
+            (s.state === "success" && s.description === MERGE_AUTHORIZED)),
       );
+      if (retryLatched) {
+        // A recorded merge authorization on a still-open PR is an incomplete
+        // attempt, even if the earlier rollback write failed.
+        if (latestOwn()?.state !== "failure")
+          await publish("failure", RETRY_REQUIRED);
+        if (context.eventName !== "workflow_dispatch") {
+          core.info(`PR ${pull_number}: ${RETRY_REQUIRED}`);
+          continue;
+        }
+      }
+      const slotsNeeded = retryLatched ? 2 : 3;
+      if (
+        cached.filter((s) => s.context === CONTEXT).length >
+        STATUS_CAP - slotsNeeded
+      )
+        throw new Error(
+          "Insufficient status capacity for a protected merge and its revocation",
+        );
+      // Native auto-merge can consume a green status before the fresh reread.
+      // Require the repository setting to be explicitly off, even without a queue.
+      const { data: repository } = await github.rest.repos.get(repo);
+      if (repository?.allow_auto_merge !== false)
+        throw new Error(
+          "Repository native auto-merge must be explicitly disabled",
+        );
+      // Confirm a durable red marker before the first green attempt. If both
+      // green and rollback fail to record, automated retries must still stop.
+      if (!retryLatched) await publish("failure", RETRY_REQUIRED);
+      if (isCanary && !inCanaryWindow()) {
+        await publish("failure", blocked);
+        continue;
+      }
+      authorizationAttempted = true;
+      await publish("success", MERGE_AUTHORIZED);
       // A complete second read follows the status write: no cached approval or CI.
-      if (!(await evaluate())) {
-        await publish("failure", BLOCKED);
+      if (!(await evaluate()) || (isCanary && !inCanaryWindow())) {
+        await publish("failure", RETRY_REQUIRED, true);
         continue;
       }
       const { data: merged } = await github.rest.pulls.merge({
@@ -280,7 +403,17 @@ async function run({
       core.warning(`PR ${pull_number}: ${error.message}`);
       core.setFailed(`PR ${pull_number}: ${error.message}`);
       try {
-        await publish("failure", `Fail closed: ${error.message}`);
+        // A green write can reach GitHub even if its response is lost.
+        // After attempting it, a cached red cannot stand in for rollback.
+        await publish(
+          "failure",
+          authorizationAttempted
+            ? RETRY_REQUIRED
+            : canaryBot
+              ? CANARY_BLOCKED
+              : `Fail closed: ${error.message}`,
+          authorizationAttempted,
+        );
       } catch (writeError) {
         core.setFailed(`Cannot revoke policy status: ${writeError.message}`);
       }
