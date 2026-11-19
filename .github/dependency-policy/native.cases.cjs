@@ -15,10 +15,12 @@ function harness() {
   const fixture = repositoryFixture();
   const h = {
     hostVerified: true,
+    repository: { allow_auto_merge: false },
     fixture,
     calls: [],
     errors: [],
     warnings: [],
+    logs: [],
     reviews: [],
     statuses: [],
     associated: [],
@@ -54,10 +56,12 @@ function harness() {
     })),
     onRead: () => {},
     onPublish: () => {},
+    onPublished: () => {},
     onMerge: () => {},
     onDispatch: () => {},
     onRevoke: () => {},
     onStatuses: () => {},
+    onRepository: () => {},
   };
   let reads = 0;
   const api = (name, fn) => async (args) => {
@@ -67,7 +71,11 @@ function harness() {
   const github = {
     rest: {
       pulls: {
-        list: api("list", () => [h.pr]),
+        list: api("list", () =>
+          [h.pr, ...h.otherPRs.values()].filter(
+            (pr) => pr.state === "open" && pr.base.ref === "main",
+          ),
+        ),
         get: api("get", ({ pull_number }) => {
           h.onRead(++reads);
           const pr =
@@ -79,11 +87,30 @@ function harness() {
         listCommits: api("commits", () => h.fixture.commits),
         listReviews: api("reviews", () => h.reviews),
         merge: api("merge", (args) => {
-          h.onMerge(args);
-          return { merged: true, sha: "merged" };
+          const { sha, pull_number } = args;
+          const { strict, checks } = h.protection.required_status_checks;
+          const current = h.statuses.filter((s) => s.sha === sha);
+          if (
+            h.pr.number !== pull_number ||
+            h.pr.head.sha !== sha ||
+            h.pr.state !== "open" ||
+            h.pr.base.ref !== "main" ||
+            h.pr.draft ||
+            h.pr.mergeable !== true ||
+            (strict && h.pr.mergeable_state === "behind") ||
+            !checkStates(checks, h.runs, current).every(
+              (state) => state === "success",
+            )
+          )
+            throw new Error("Protected merge rejected by GitHub");
+          return h.onMerge(args) ?? { merged: true, sha: "merged" };
         }),
       },
       repos: {
+        get: api("repository", () => {
+          h.onRepository();
+          return h.repository;
+        }),
         getBranchProtection: api("protection", () => h.protection),
         listPullRequestsAssociatedWithCommit: api(
           "associated",
@@ -99,9 +126,9 @@ function harness() {
             ),
           ).toString("base64"),
         })),
-        listCommitStatusesForRef: api("statuses", () => {
+        listCommitStatusesForRef: api("statuses", ({ ref }) => {
           h.onStatuses();
-          return h.statuses;
+          return h.statuses.filter((s) => s.sha === undefined || s.sha === ref);
         }),
         createCommitStatus: api("publish", (s) => {
           h.onPublish(s);
@@ -116,6 +143,7 @@ function harness() {
             creator: { login: "github-actions[bot]" },
           };
           h.statuses.unshift(written);
+          h.onPublished(written);
           return written;
         }),
       },
@@ -130,19 +158,23 @@ function harness() {
     graphql: async (_query, args) => {
       h.calls.push({ name: "revoke", args });
       h.onRevoke();
-      h.pr.auto_merge = null;
+      const queued = [h.pr, ...h.otherPRs.values()].find(
+        (pr) => pr.node_id === args.id,
+      );
+      queued.auto_merge = null;
     },
     paginate: async (method, args) => (await method(args)).data,
   };
-  h.execute = (enabled = true) =>
+  h.execute = (enabled = true, overrides = {}) =>
     run({
       github,
       context: {
         repo: { owner: "test", repo: "test" },
         payload: { pull_request: structuredClone(h.pr) },
+        eventName: h.eventName,
       },
       core: {
-        info: () => {},
+        info: (s) => h.logs.push(s),
         warning: (s) => h.warnings.push(s),
         setFailed: (s) => h.errors.push(s),
       },
@@ -152,6 +184,7 @@ function harness() {
       requiredChecks: h.protection.required_status_checks.checks.filter(
         (c) => c.context !== policy.CONTEXT,
       ),
+      ...overrides,
     });
   h.merged = () => h.calls.some((c) => c.name === "merge");
   h.lastStatus = () =>
@@ -660,7 +693,7 @@ for (const mode of ["disabled", "held", "missing approval", "behind"])
     h.reviews = [approve()];
     await h.execute();
     assert.equal(h.pr.head.sha, head);
-    assert.equal(writeCount(h), 2);
+    assert.equal(writeCount(h), 3);
     assert.equal(h.merged(), true);
     assert.equal(h.calls.at(-1).name, "dispatch");
     assert.deepEqual(h.errors, []);
@@ -790,4 +823,627 @@ test("status-list API failure still revokes a stale success and reports the genu
   assert.ok(h.errors.some((s) => s.includes("status list unavailable")));
   assert.equal(h.merged(), false);
 });
+
+const START = Date.UTC(2026, 0, 1);
+const DAY = 24 * 60 * 60 * 1000;
+const CANARY = { pr: 42, issuedAt: START, expiresAt: START + DAY };
+const CANARY_HEAD = "a".repeat(40);
+
+function canaryHarness() {
+  const h = harness();
+  h.hostVerified = false;
+  const setHead = (sha) => {
+    h.pr.head.sha = sha;
+    h.fixture.head = sha;
+    h.fixture.commits[0].sha = sha;
+  };
+  setHead(CANARY_HEAD);
+  h.setHead = setHead;
+  h.observe = (canary = CANARY, options = {}) =>
+    h.execute(false, {
+      canary,
+      now: () => START,
+      policy: undefined,
+      ...options,
+    });
+  return h;
+}
+
+function assertCanaryBlocked(h) {
+  assert.equal(h.lastStatus(), "failure");
+  assert.equal(
+    h.calls.some(
+      (c) =>
+        ["merge", "dispatch"].includes(c.name) ||
+        (c.name === "publish" && c.args.state === "success"),
+    ),
+    false,
+  );
+}
+
+test("committed canary and activation are empty and legacy queue revocation still runs", async () => {
+  const config = JSON.parse(
+    fs.readFileSync(".github/dependency-policy/activation.json", "utf8"),
+  );
+  assert.equal(config.canary, null);
+  assert.equal(config.enabled, false);
+  assert.equal(config.hostPrerequisitesVerified, false);
+  const h = canaryHarness();
+  h.pr.auto_merge = { enabled: true };
+  await h.execute(undefined, {
+    enabled: undefined,
+    hostPrerequisitesVerified: undefined,
+    policy: undefined,
+  });
+  assert.equal(h.pr.auto_merge, null);
+  assert.deepEqual(h.logs, []);
+  assertCanaryBlocked(h);
+  assert.equal(
+    h.calls.some((c) => c.name === "files"),
+    false,
+  );
+});
+
+for (const [name, canary, time = START] of [
+  ["empty object", {}],
+  ["wrong shape", []],
+  ["false", false],
+  ["unknown key", { ...CANARY, other: true }],
+  ["invalid PR", { ...CANARY, pr: "42" }],
+  ["missing issue time", { ...CANARY, issuedAt: undefined }],
+  ["future start", CANARY, START - 1],
+  ["expired", CANARY, START + DAY],
+  ["oversized", { ...CANARY, expiresAt: START + DAY + 1 }],
+  ["invalid approval", { ...CANARY, mergeApproved: `${CANARY_HEAD}\n` }],
+  ["other PR", { ...CANARY, pr: 99 }],
+])
+  test(`${name} canary fails closed even with general activation and attestation`, async () => {
+    const h = canaryHarness();
+    h.pr.auto_merge = { enabled: true };
+    await h.observe(canary, {
+      enabled: true,
+      hostPrerequisitesVerified: true,
+      now: () => time,
+    });
+    assert.equal(h.pr.auto_merge, null);
+    assert.equal(
+      h.calls.some((c) => c.name === "files"),
+      false,
+    );
+    assert.deepEqual(h.logs, []);
+    assertCanaryBlocked(h);
+  });
+
+test("a scan observes the selected PR and still revokes and blocks other dependency PRs", async () => {
+  const h = canaryHarness();
+  const other = {
+    ...structuredClone(h.pr),
+    number: 43,
+    node_id: "PR43",
+    head: { sha: "b".repeat(40) },
+    auto_merge: { enabled: true },
+  };
+  h.otherPRs.set(other.number, other);
+  await h.observe(CANARY, {
+    context: { repo: { owner: "test", repo: "test" }, payload: {} },
+  });
+  assert.equal(other.auto_merge, null);
+  assert.deepEqual(
+    h.calls.filter((c) => c.name === "files").map((c) => c.args.pull_number),
+    [42],
+  );
+  assert.deepEqual(h.logs, [
+    `Canary PR 42 at ${CANARY_HEAD}: eligible (observation only)`,
+  ]);
+  assertCanaryBlocked(h);
+});
+
+test("ordinary author at the configured number retains baseline manual reporting", async () => {
+  const h = canaryHarness();
+  h.pr.user.login = "human";
+  await h.observe({ ...CANARY, mergeApproved: CANARY_HEAD });
+  assert.equal(h.lastStatus(), "success");
+  assert.match(h.statuses[0].description, /^Ordinary author PR:/);
+  assert.deepEqual(h.logs, []);
+  assert.equal(
+    h.calls.some((c) => ["files", "merge", "dispatch"].includes(c.name)),
+    false,
+  );
+});
+
+for (const approval of [undefined, null, "b".repeat(40)])
+  test(`eligible canary only observes with merge approval ${approval}`, async () => {
+    const h = canaryHarness();
+    h.statuses.push({
+      id: 1,
+      context: policy.CONTEXT,
+      creator: { login: "github-actions[bot]" },
+      state: "success",
+    });
+    await h.observe({ ...CANARY, mergeApproved: approval });
+    assertCanaryBlocked(h);
+    assert.equal(h.statuses[0].context, policy.CONTEXT);
+    assert.equal(h.statuses[0].state, "failure");
+    assert.match(h.logs[0], /: eligible \(observation only\)$/);
+  });
+
+for (const [name, mutate] of [
+  [
+    "hold",
+    (h) => {
+      h.pr.labels = [{ name: "hold" }];
+    },
+  ],
+  [
+    "changes requested",
+    (h) => {
+      h.reviews = [approve("other", "CHANGES_REQUESTED")];
+    },
+  ],
+  [
+    "draft",
+    (h) => {
+      h.pr.draft = true;
+    },
+  ],
+  [
+    "conflict",
+    (h) => {
+      h.pr.mergeable = false;
+    },
+  ],
+  [
+    "behind main",
+    (h) => {
+      h.pr.mergeable_state = "behind";
+    },
+  ],
+  [
+    "missing required CI",
+    (h) => {
+      h.runs.pop();
+    },
+  ],
+  [
+    "CI from the wrong app",
+    (h) => {
+      h.runs[0].app.id = 999;
+    },
+  ],
+  [
+    "newer failed CI",
+    (h) => {
+      h.runs.push({ ...h.runs[0], id: 900, conclusion: "failure" });
+    },
+  ],
+])
+  test(`observation evaluates the ${name} veto`, async () => {
+    const h = canaryHarness();
+    mutate(h);
+    await h.observe();
+    assertCanaryBlocked(h);
+    assert.match(h.logs[0], /: blocked \(observation only\)$/);
+  });
+
+for (const [name, reviews] of [
+  ["stale", [approve()]],
+  [
+    "dismissed",
+    [
+      approve("pnupu", "APPROVED", CANARY_HEAD),
+      approve("pnupu", "DISMISSED", CANARY_HEAD),
+    ],
+  ],
+  ["other", [approve("other", "APPROVED", CANARY_HEAD)]],
+  ["bot", [approve("pnupu", "APPROVED", CANARY_HEAD, "Bot")]],
+])
+  test(`HUMAN canary observation rejects ${name} reviews`, async () => {
+    const h = canaryHarness();
+    h.fixture.after[1].packages["node_modules/typescript"].integrity =
+      "sha512-uncovered";
+    assert.equal(policy.classify(h.fixture).lane, "HUMAN");
+    h.reviews = reviews;
+    await h.observe();
+    assertCanaryBlocked(h);
+    assert.match(h.logs[0], /: blocked \(observation only\)$/);
+  });
+
+test("HUMAN canary follows a new head and evaluates review independently of merge permission", async () => {
+  const h = canaryHarness();
+  h.fixture.after[1].packages["node_modules/typescript"].integrity =
+    "sha512-uncovered";
+  const newHead = "b".repeat(40);
+  const config = { ...CANARY, mergeApproved: CANARY_HEAD };
+  h.setHead(newHead);
+  assert.equal(policy.classify(h.fixture).lane, "HUMAN");
+  h.reviews = [approve("pnupu", "APPROVED", CANARY_HEAD)];
+  await h.observe(config);
+  h.reviews.push(approve("pnupu", "APPROVED", newHead));
+  await h.observe(config);
+  assert.deepEqual(h.logs, [
+    `Canary PR 42 at ${newHead}: blocked (observation only)`,
+    `Canary PR 42 at ${newHead}: eligible (observation only)`,
+  ]);
+  assert.equal(h.calls.filter((c) => c.name === "reviews").length, 2);
+  assertCanaryBlocked(h);
+});
+
+test("an explicitly approved canary head alone can merge and dispatch after two reads", async () => {
+  const h = canaryHarness();
+  await h.observe({ ...CANARY, mergeApproved: CANARY_HEAD });
+  assert.equal(h.lastStatus(), "success");
+  assert.equal(h.calls.filter((c) => c.name === "reviews").length, 2);
+  assert.equal(h.calls.filter((c) => c.name === "checks").length, 2);
+  assert.equal(h.calls.find((c) => c.name === "merge").args.sha, CANARY_HEAD);
+  assert.equal(h.calls.at(-1).name, "dispatch");
+  assert.deepEqual(h.errors, []);
+});
+
+for (const [name, mutate] of [
+  [
+    "late hold",
+    (h) => {
+      h.pr.labels = [{ name: "hold" }];
+    },
+  ],
+  [
+    "late CI failure",
+    (h) => {
+      h.runs[0].conclusion = "failure";
+    },
+  ],
+  ["window expiry", (_h, expire) => expire()],
+])
+  test(`approved canary reread catches ${name} before merge or dispatch`, async () => {
+    const h = canaryHarness();
+    let now = START;
+    h.onPublish = (s) => {
+      if (s.state === "success")
+        mutate(h, () => {
+          now = START + DAY;
+        });
+    };
+    await h.observe(
+      { ...CANARY, mergeApproved: CANARY_HEAD },
+      { now: () => now },
+    );
+    assert.deepEqual(
+      h.calls.filter((c) => c.name === "publish").map((c) => c.args.state),
+      ["failure", "success", "failure"],
+    );
+    assert.equal(h.calls.filter((c) => c.name === "reviews").length, 2);
+    assert.equal(
+      h.calls.some((c) => ["merge", "dispatch"].includes(c.name)),
+      false,
+    );
+  });
+
+test("a second same-head bot PR blocks the merge-authorizing status", async () => {
+  const h = canaryHarness();
+  h.otherPRs.set(43, { ...structuredClone(h.pr), number: 43, node_id: "PR43" });
+  await h.observe({ ...CANARY, mergeApproved: CANARY_HEAD });
+  assertCanaryBlocked(h);
+});
+
+test("500 same-SHA ordinary and observation scans preserve the status budget for recovery", async () => {
+  const h = canaryHarness();
+  const bot = h.pr;
+  const ordinary = {
+    ...structuredClone(bot),
+    number: 43,
+    user: { login: "human" },
+  };
+  const otherBot = { ...structuredClone(bot), number: 44, node_id: "PR44" };
+  h.otherPRs.set(bot.number, bot);
+  h.associated = [bot];
+  h.statuses.push({
+    id: 1,
+    context: policy.CONTEXT,
+    creator: { login: "another-publisher" },
+    state: "failure",
+    description: "Canary policy blocks merge",
+  });
+  for (let scan = 0; scan < 500; scan++) {
+    h.pr = bot;
+    await h.observe();
+    h.pr = ordinary;
+    await h.observe();
+    h.pr = otherBot;
+    await h.observe();
+  }
+  assert.equal(writeCount(h), 1);
+  assertCanaryBlocked(h);
+  assert.deepEqual(h.errors, []);
+  h.pr = bot;
+  await h.observe({ ...CANARY, mergeApproved: CANARY_HEAD });
+  assert.equal(writeCount(h), 3);
+  assert.equal(h.calls.at(-1).name, "dispatch");
+});
+
+for (const mode of ["standard", "canary"])
+  test(`native auto-merge could consume green before the ${mode} reread`, async () => {
+    const h = canaryHarness();
+    h.hostVerified = mode === "standard";
+    h.repository.allow_auto_merge = true;
+    h.pr.auto_merge = { enabled: true };
+    let autoMerged = false;
+    h.onPublish = ({ state }) => {
+      // A request enabled after the first read can consume the green status
+      // immediately, before the executor rereads the PR and can revoke it.
+      if (state === "success" && h.repository.allow_auto_merge) {
+        h.pr.state = "closed";
+        autoMerged = true;
+      }
+    };
+    await h.observe(
+      mode === "standard" ? null : { ...CANARY, mergeApproved: CANARY_HEAD },
+      { enabled: mode === "standard" },
+    );
+    assert.equal(h.pr.auto_merge, null);
+    assert.equal(autoMerged, false);
+    assertCanaryBlocked(h);
+  });
+
+test("500 identical protected merge refusals leave same-head dispatch retry available", async () => {
+  const h = canaryHarness();
+  const config = { ...CANARY, mergeApproved: CANARY_HEAD };
+  h.onMerge = () => {
+    throw new Error("403 protected merge refused");
+  };
+  for (let scan = 0; scan < 500; scan++) await h.observe(config);
+  assert.equal(h.lastStatus(), "failure");
+  assert.equal(writeCount(h), 3);
+  assert.equal(h.calls.filter((c) => c.name === "merge").length, 1);
+  assert.equal(
+    h.calls.some((c) => c.name === "dispatch"),
+    false,
+  );
+  assert.ok(h.errors.some((s) => s.includes("403 protected merge refused")));
+  h.onMerge = () => {};
+  // Ordinary events do not retry a refused merge, even when the host recovers.
+  await h.observe(config);
+  assert.equal(writeCount(h), 3);
+  h.eventName = "workflow_dispatch";
+  await h.observe(config);
+  assert.equal(h.pr.head.sha, CANARY_HEAD);
+  assert.equal(writeCount(h), 4);
+  assert.equal(h.calls.at(-1).name, "dispatch");
+});
+
+for (const mode of ["late hold", "reread API error"])
+  test(`500 scans after ${mode} leave same-head dispatch retry available`, async () => {
+    const h = canaryHarness();
+    const config = { ...CANARY, mergeApproved: CANARY_HEAD };
+    let publishedGreen = false;
+    h.onPublish = ({ state }) => {
+      if (state === "success") {
+        publishedGreen = true;
+        if (mode === "late hold") h.pr.labels = [{ name: "hold" }];
+      }
+    };
+    h.onStatuses = () => {
+      if (mode === "reread API error" && publishedGreen)
+        throw new Error("Status API denied the fresh read");
+    };
+    for (let scan = 0; scan < 500; scan++) {
+      publishedGreen = false;
+      h.pr.labels = [];
+      await h.observe(config);
+    }
+    assert.equal(h.lastStatus(), "failure");
+    assert.equal(writeCount(h), 3);
+    assert.equal(
+      h.calls.some((c) => ["merge", "dispatch"].includes(c.name)),
+      false,
+    );
+    if (mode === "reread API error")
+      assert.ok(
+        h.errors.some((s) => s.includes("Status API denied the fresh read")),
+      );
+    h.onPublish = () => {};
+    h.onStatuses = () => {};
+    h.pr.labels = [];
+    h.eventName = "workflow_dispatch";
+    await h.observe(config);
+    assert.equal(h.pr.head.sha, CANARY_HEAD);
+    assert.equal(writeCount(h), 4);
+    assert.equal(h.calls.at(-1).name, "dispatch");
+  });
+
+for (const retry of ["schedule", "workflow_dispatch"])
+  test(`after failed rollback, ${retry} restores red before any retry`, async () => {
+    const h = canaryHarness();
+    const config = { ...CANARY, mergeApproved: CANARY_HEAD };
+    let publishedGreen = false;
+    h.onPublish = ({ state }) => {
+      if (state === "success") {
+        publishedGreen = true;
+        h.pr.labels = [{ name: "hold" }];
+      }
+      if (state === "failure" && publishedGreen)
+        throw new Error("503 writing rollback");
+    };
+    await h.observe(config);
+    assert.equal(h.statuses[0].state, "success");
+    assert.equal(writeCount(h), 2);
+    assert.equal(h.merged(), false);
+    assert.ok(h.errors.some((s) => s.includes("Cannot revoke policy status")));
+
+    h.onPublish = () => {};
+    h.pr.labels = [];
+    h.eventName = retry;
+    await h.observe(config);
+    if (retry === "schedule") {
+      assert.equal(h.statuses[0].state, "failure");
+      assert.equal(writeCount(h), 3);
+      assert.equal(
+        h.calls.some((c) => ["merge", "dispatch"].includes(c.name)),
+        false,
+      );
+      h.eventName = "workflow_dispatch";
+      await h.observe(config);
+    }
+    assert.deepEqual(
+      h.statuses.map((s) => s.state),
+      ["success", "failure", "success", "failure"],
+    );
+    assert.equal(h.calls.find((c) => c.name === "merge").args.sha, CANARY_HEAD);
+    assert.equal(h.calls.at(-1).name, "dispatch");
+  });
+
+test("a lost green write response cannot reuse a cached red status on rollback", async () => {
+  const h = canaryHarness();
+  const config = { ...CANARY, mergeApproved: CANARY_HEAD };
+  h.onMerge = () => {
+    throw new Error("Protected merge refused");
+  };
+  await h.observe(config);
+  assert.equal(h.statuses[0].state, "failure");
+  assert.equal(writeCount(h), 3);
+
+  h.eventName = "workflow_dispatch";
+  h.onMerge = () => {};
+  h.onPublished = ({ state }) => {
+    if (state === "success") throw new Error("Lost green response");
+  };
+  await h.observe(config);
+  assert.equal(h.statuses[0].state, "failure");
+  assert.equal(writeCount(h), 5);
+  assert.equal(h.calls.filter((c) => c.name === "merge").length, 1);
+  assert.equal(
+    h.calls.some((c) => c.name === "dispatch"),
+    false,
+  );
+  assert.ok(h.errors.some((s) => s.includes("Lost green response")));
+});
+
+test("status-write outage on green and rollback requires a manual same-head retry", async () => {
+  const h = canaryHarness();
+  const config = { ...CANARY, mergeApproved: CANARY_HEAD };
+  await h.observe();
+  let attemptedGreen = false;
+  h.onPublish = ({ state }) => {
+    if (state === "success") attemptedGreen = true;
+    if (attemptedGreen) throw new Error("503 writing policy status");
+  };
+  await h.observe(config);
+  assert.equal(attemptedGreen, true);
+  assert.equal(h.statuses[0].state, "failure");
+  assert.equal(h.merged(), false);
+  assert.ok(h.errors.some((s) => s.includes("Cannot revoke policy status")));
+
+  h.onPublish = () => {};
+  h.eventName = "schedule";
+  await h.observe(config);
+  assert.equal(h.merged(), false);
+  assert.equal(h.statuses[0].state, "failure");
+
+  h.eventName = "workflow_dispatch";
+  await h.observe(config);
+  assert.deepEqual(
+    h.statuses.map((s) => s.state),
+    ["success", "failure", "failure"],
+  );
+  assert.equal(h.calls.find((c) => c.name === "merge").args.sha, CANARY_HEAD);
+  assert.equal(h.calls.at(-1).name, "dispatch");
+});
+
+test("protected merge cannot authorize green before confirming its red marker", async () => {
+  const h = canaryHarness();
+  const config = { ...CANARY, mergeApproved: CANARY_HEAD };
+  h.onPublish = ({ state }) => {
+    if (state === "failure") throw new Error("Attempt marker write failed");
+  };
+  await h.observe(config);
+  assertCanaryBlocked(h);
+  assert.equal(writeCount(h), 0);
+  assert.ok(h.errors.some((s) => s.includes("Attempt marker write failed")));
+});
+
+for (const mode of ["missing", "unreadable"])
+  test(`approved canary fails closed when the auto-merge setting is ${mode}`, async () => {
+    const h = canaryHarness();
+    h.repository = {};
+    if (mode === "unreadable")
+      h.onRepository = () => {
+        throw new Error("Repository metadata denied");
+      };
+    await h.observe({ ...CANARY, mergeApproved: CANARY_HEAD });
+    assertCanaryBlocked(h);
+    assert.ok(
+      h.errors.some((s) =>
+        s.includes(
+          mode === "unreadable"
+            ? "Repository metadata denied"
+            : "auto-merge must be explicitly disabled",
+        ),
+      ),
+    );
+  });
+
+test("observation still evaluates and revokes a queue with native auto-merge enabled", async () => {
+  const h = canaryHarness();
+  h.repository.allow_auto_merge = true;
+  h.pr.auto_merge = { enabled: true };
+  await h.observe();
+  assert.equal(h.pr.auto_merge, null);
+  assertCanaryBlocked(h);
+  assert.match(h.logs[0], /: eligible \(observation only\)$/);
+  assert.equal(
+    h.calls.some((c) => c.name === "repository"),
+    false,
+  );
+});
+
+test("only a trusted refusal latches retry and a manual retry still obeys CI", async () => {
+  const h = canaryHarness();
+  const config = { ...CANARY, mergeApproved: CANARY_HEAD };
+  h.statuses.push({
+    id: 1,
+    sha: CANARY_HEAD,
+    context: policy.CONTEXT,
+    creator: { login: "other" },
+    state: "failure",
+    description:
+      "Protected merge did not complete: retry via workflow_dispatch",
+  });
+  h.onMerge = () => ({ merged: false, message: "Protected merge rejected" });
+  await h.observe(config);
+  assert.equal(h.calls.filter((c) => c.name === "merge").length, 1);
+  assert.ok(h.errors.some((s) => s.includes("Protected merge rejected")));
+  assert.equal(h.lastStatus(), "failure");
+  h.onMerge = () => {};
+  h.runs[0].conclusion = "failure";
+  h.eventName = "workflow_dispatch";
+  await h.observe(config);
+  assert.equal(h.calls.filter((c) => c.name === "merge").length, 1);
+  assert.equal(h.lastStatus(), "failure");
+  h.runs[0].conclusion = "success";
+  h.eventName = "schedule";
+  await h.observe(config);
+  assert.equal(h.calls.filter((c) => c.name === "merge").length, 1);
+  assert.equal(
+    h.calls.some((c) => c.name === "dispatch"),
+    false,
+  );
+});
+
+for (const usedSlots of [998, 999])
+  test(`a first protected merge needs three status slots, ${usedSlots} already used`, async () => {
+    const h = canaryHarness();
+    const config = { ...CANARY, mergeApproved: CANARY_HEAD };
+    h.statuses = Array.from({ length: usedSlots }, (_, i) => ({
+      id: usedSlots - i,
+      sha: CANARY_HEAD,
+      context: policy.CONTEXT,
+      creator: { login: "other" },
+      state: "failure",
+    }));
+    h.acceptedWrites.set(`${CANARY_HEAD}:${policy.CONTEXT}`, usedSlots);
+    h.eventName = "workflow_dispatch";
+    await h.observe(config);
+    assertCanaryBlocked(h);
+    assert.equal(writeCount(h), usedSlots + 1);
+    assert.ok(h.errors.some((s) => s.includes("Insufficient status capacity")));
+  });
 /* eslint-enable @typescript-eslint/no-require-imports */
