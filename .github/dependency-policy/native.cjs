@@ -2,6 +2,9 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 const activation = require("./activation.json");
 const WORKFLOW = "ci-cd.yml";
+const POLICY_REPOSITORY =
+  "tvv-lippu-ja-maksujarjestelma-oy/waltti-apc-mqtt-mqtt-duplicator";
+const POLICY_WORKFLOW_REF = `${POLICY_REPOSITORY}/.github/workflows/dependabot-auto-approve.yml@refs/heads/main`;
 const REQUIRED = activation.requiredChecks;
 const PUBLISHER = "github-actions[bot]";
 const BLOCKED =
@@ -20,12 +23,12 @@ function validCanary(canary) {
     typeof canary !== "object" ||
     Array.isArray(canary) ||
     Object.keys(canary).some(
-      (key) => !["pr", "issuedAt", "expiresAt", "mergeApproved"].includes(key),
+      (key) => !["pr", "issuedAt", "expiresAt"].includes(key),
     )
   )
     return false;
-  // Timestamps are UTC Unix milliseconds. Approval, when present, is a full SHA.
-  const { pr, issuedAt, expiresAt, mergeApproved } = canary;
+  // Timestamps are UTC Unix milliseconds.
+  const { pr, issuedAt, expiresAt } = canary;
   return (
     Number.isSafeInteger(pr) &&
     pr > 0 &&
@@ -33,11 +36,7 @@ function validCanary(canary) {
     issuedAt > 0 &&
     Number.isSafeInteger(expiresAt) &&
     expiresAt > issuedAt &&
-    expiresAt - issuedAt <= CANARY_MAX_MS &&
-    (mergeApproved == null ||
-      (typeof mergeApproved === "string" &&
-        mergeApproved.length === 40 &&
-        /^[0-9a-f]{40}$/.test(mergeApproved)))
+    expiresAt - issuedAt <= CANARY_MAX_MS
   );
 }
 
@@ -73,6 +72,8 @@ async function run({
   canary = activation.canary,
   requiredChecks = REQUIRED,
   now = Date.now,
+  workflowRef = process.env.GITHUB_WORKFLOW_REF,
+  runAttempt = process.env.GITHUB_RUN_ATTEMPT,
 }) {
   const isCanary = canary != null;
   const wellFormedCanary = validCanary(canary);
@@ -90,6 +91,24 @@ async function run({
   const isOwnPolicyStatus = (s) =>
     s.context === CONTEXT && s.creator?.login === PUBLISHER;
   const repo = context.repo;
+  // The GitHub Actions context supplies event and actor metadata. The dispatch
+  // payload supplies only the inputs, never the authority to use them.
+  const { canary_pr, approved_head } = context.payload.inputs || {};
+  let dispatchApprovedHead =
+    wellFormedCanary &&
+    context.eventName === "workflow_dispatch" &&
+    context.actor === "pnupu" &&
+    runAttempt === "1" &&
+    `${repo.owner}/${repo.repo}` === POLICY_REPOSITORY &&
+    context.ref === "refs/heads/main" &&
+    context.payload.repository?.default_branch === "main" &&
+    workflowRef === POLICY_WORKFLOW_REF &&
+    canary_pr === String(canary.pr) &&
+    typeof approved_head === "string" &&
+    approved_head.length === 40 &&
+    /^[0-9a-f]{40}$/.test(approved_head)
+      ? approved_head
+      : null;
   const list = (method, args) =>
     github.paginate(method, { ...repo, per_page: 100, ...args });
   const pulls = context.payload.pull_request
@@ -125,10 +144,14 @@ async function run({
         }
       }
       const previous = latestOwn();
+      // Keep a trusted red retry marker rather than spending a status slot on wording.
       if (
         !force &&
         previous?.state === state &&
-        previous.description === description
+        (previous.description === description ||
+          (state === "failure" &&
+            description === CANARY_BLOCKED &&
+            previous.description === RETRY_REQUIRED))
       )
         return;
       const { data: written } = await github.rest.repos.createCommitStatus({
@@ -230,7 +253,8 @@ async function run({
       // Only a separately approved exact head can enter the canary merge path.
       // Observation keeps the required status red even if an old success exists.
       const observing =
-        isCanary && (!canary.mergeApproved || canary.mergeApproved !== sha);
+        isCanary && (!dispatchApprovedHead || dispatchApprovedHead !== sha);
+      if (isCanary && !observing) dispatchApprovedHead = null;
       // Both bot PRs can share a SHA. Keep their blocking writes identical.
       const blocked = isCanary ? CANARY_BLOCKED : BLOCKED;
       if (observing) await publish("failure", blocked);
