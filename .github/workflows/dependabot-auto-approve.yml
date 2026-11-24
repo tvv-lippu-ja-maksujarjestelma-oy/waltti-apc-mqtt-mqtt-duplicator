@@ -26,6 +26,15 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      canary_pr:
+        description: Configured canary pull request number
+        type: string
+        required: false
+      approved_head:
+        description: Exact 40-character head SHA approved for this canary attempt
+        type: string
+        required: false
 permissions:
   actions: write
   checks: read

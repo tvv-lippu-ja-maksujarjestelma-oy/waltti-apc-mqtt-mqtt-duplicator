@@ -1,6 +1,7 @@
 {
   "enabled": false,
   "hostPrerequisitesVerified": false,
+  "canary": null,
   "requiredChecks": [
     {
       "context": "CodeQL",
